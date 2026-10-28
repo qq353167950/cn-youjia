@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">油价</string>
+    <string name="main_activity_title">油价</string>
+    <string name="widget_desc">桌面显示 92#/95#/98#/0# 柴油实时油价</string>
+</resources>

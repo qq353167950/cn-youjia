@@ -1,0 +1,43 @@
+# ---------- 依赖 ----------
+node_modules/
+
+# ---------- 构建产物 ----------
+dist/
+*.log
+
+# ---------- Rust ----------
+src-tauri/target/
+src-tauri/Cargo.lock.bak
+
+# ---------- Android 生成目录 ----------
+# Tauri 会在本地重新生成，但其中的定制文件需要保留，见下方白名单
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/build/
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/.tauri/
+src-tauri/gen/android/*.iml
+src-tauri/gen/android/.idea/
+
+# ---------- iOS Xcode 产物 ----------
+src-tauri/gen/apple/**/build/
+src-tauri/gen/apple/**/DerivedData/
+src-tauri/gen/apple/**/xcuserdata/
+src-tauri/gen/apple/Pods/
+src-tauri/gen/schemas/
+
+# ---------- 系统 / 编辑器 ----------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ---------- 签名密钥（绝不上传） ----------
+*.keystore
+*.jks
+*.p12
+*.mobileprovision
+keystore.properties
+.env
+.env.*

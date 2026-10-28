@@ -1,0 +1,11 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 深色基座。暂不启用透明系统栏/edge-to-edge，避免 WebView 被系统栏裁切或高度为 0
+         导致"看起来全黑"。等确认能正常显示后再做沉浸式。 -->
+    <style name="Theme.youjia_app" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:windowBackground">@color/app_bg</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@color/app_bg</item>
+        <item name="android:navigationBarColor">@color/app_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

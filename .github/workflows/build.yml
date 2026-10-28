@@ -1,0 +1,236 @@
+name: Build & Release
+
+# 打 tag（如 v2.0.0）时自动构建 Android APK 并发布 Release。
+# iOS 只有在配好 Apple 证书与 macOS 环境时才会构建，否则自动跳过。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 2.0.0）"
+        required: true
+        default: "2.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # Android：始终构建
+  # ============================================================
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "ndk;27.0.12077973" > /dev/null
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "Building version $V"
+
+      - name: Set version in tauri.conf.json
+        run: |
+          node -e "
+          const fs=require('fs');
+          const p='src-tauri/tauri.conf.json';
+          const c=JSON.parse(fs.readFileSync(p,'utf8'));
+          c.version='${{ steps.ver.outputs.version }}';
+          fs.writeFileSync(p, JSON.stringify(c,null,2)+'\n');
+          console.log('version ->', c.version);
+          "
+
+      - name: Restore Android signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::缺少 ANDROID_KEYSTORE_BASE64 密钥"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "keystore restored: $(stat -c%s "$RUNNER_TEMP/release.keystore") bytes"
+
+      - name: Build APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          npx tauri android init --ci || true
+          npx tauri android build --target aarch64 --split-per-abi
+
+      - name: Sign APK
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          UNSIGNED=$(ls src-tauri/gen/android/app/build/outputs/apk/arm64/release/*-unsigned.apk | head -1)
+          echo "unsigned: $UNSIGNED"
+
+          OUT="youjia-${{ steps.ver.outputs.version }}-arm64.apk"
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.keystore" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KS_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --out "$OUT" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify "$OUT"
+          echo "APK: $OUT ($(stat -c%s "$OUT") bytes)"
+          echo "APK_NAME=$OUT" >> $GITHUB_ENV
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: youjia-*-arm64.apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: 油价 v${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: youjia-*-arm64.apk
+          body: |
+            ## 油价 v${{ steps.ver.outputs.version }}
+
+            ### 安装
+            下载 `youjia-${{ steps.ver.outputs.version }}-arm64.apk` 安装（Android 7.0+，arm64 设备）。
+
+            ### 更新说明
+            见提交记录。
+
+  # ============================================================
+  # iOS：仅当配好证书时才构建
+  # ============================================================
+  ios:
+    name: Build iOS (optional)
+    runs-on: macos-latest
+    # 没有 Apple 证书时跳过整个 job，不影响 Android 发布
+    if: ${{ vars.ENABLE_IOS_BUILD == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+
+      - name: Set version
+        run: |
+          node -e "
+          const fs=require('fs');
+          const p='src-tauri/tauri.conf.json';
+          const c=JSON.parse(fs.readFileSync(p,'utf8'));
+          c.version='${{ steps.ver.outputs.version }}';
+          fs.writeFileSync(p, JSON.stringify(c,null,2)+'\n');
+          "
+
+      - name: Install Apple certificate
+        env:
+          IOS_CERT_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERT_PASS: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASS: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+          PROVISION_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -e
+          KEYCHAIN="$RUNNER_TEMP/app.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          echo "$IOS_CERT_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$IOS_CERT_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROVISION_BASE64" | base64 -d \
+            > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+          echo "certificate installed"
+
+      - name: Build iOS
+        run: |
+          npx tauri ios init --ci || true
+          npx tauri ios build --export-method app-store-connect
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: src-tauri/gen/apple/build/**/*.ipa
+          if-no-files-found: warn
