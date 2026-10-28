@@ -1,7 +1,7 @@
-name: Build & Release
+name: Build and Release
 
-# 打 tag（如 v2.0.0）时自动构建 Android APK 并发布 Release。
-# iOS 只有在配好 Apple 证书与 macOS 环境时才会构建，否则自动跳过。
+# Trigger: pushing a v* tag builds and publishes an APK.
+# iOS builds only when credentials and the ENABLE_IOS_BUILD variable are configured.
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（如 2.0.0）"
+        description: "Version number, e.g. 2.0.0"
         required: true
         default: "2.0.0"
 
@@ -18,9 +18,6 @@ permissions:
   contents: write
 
 jobs:
-  # ============================================================
-  # Android：始终构建
-  # ============================================================
   android:
     name: Build Android APK
     runs-on: ubuntu-latest
@@ -43,27 +40,35 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      # GitHub 的 ubuntu runner 已预装 Android SDK，直接用，不要再 setup-android
-      # （该 action 会检测到预装版本号不符而报错 "Wrong version in preinstalled sdkmanager"）
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The ubuntu runner already ships an Android SDK, so we use it directly.
+      # android-actions/setup-android@v3 fails here with
+      # "Wrong version in preinstalled sdkmanager".
       - name: Setup Android env
         run: |
-          # 预装 SDK 路径
-          echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> $GITHUB_ENV
-          echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH
+          SDK=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
 
       - name: Install NDK
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --list_installed | head -20
-          # Tauri 2 需要 NDK；runner 通常已带 27.x
           sdkmanager "ndk;27.0.12077973" > /dev/null 2>&1 || true
-          ls /usr/local/lib/android/sdk/ndk/ || true
           NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | tail -1)
-          echo "NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          if [ -z "$NDK_DIR" ]; then
+            echo "No NDK found"
+            exit 1
+          fi
+          echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
           echo "Using NDK: $NDK_DIR"
-        uses: android-actions/setup-android@v3
+
       - name: Install dependencies
         run: npm ci
 
@@ -75,34 +80,33 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"
           fi
-          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Building version $V"
 
-      - name: Set version in tauri.conf.json
+      - name: Set version
         run: |
           node -e "
-          const fs=require('fs');
-          const p='src-tauri/tauri.conf.json';
-          const c=JSON.parse(fs.readFileSync(p,'utf8'));
-          c.version='${{ steps.ver.outputs.version }}';
-          fs.writeFileSync(p, JSON.stringify(c,null,2)+'\n');
+          const fs = require('fs');
+          const p = 'src-tauri/tauri.conf.json';
+          const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+          c.version = '${{ steps.ver.outputs.version }}';
+          fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
           console.log('version ->', c.version);
           "
 
-      - name: Restore Android signing key
+      - name: Restore signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::error::缺少 ANDROID_KEYSTORE_BASE64 密钥"
+            echo "Missing ANDROID_KEYSTORE_BASE64 secret"
             exit 1
           fi
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
-          echo "keystore restored: $(stat -c%s "$RUNNER_TEMP/release.keystore") bytes"
+          echo "keystore bytes: $(stat -c%s "$RUNNER_TEMP/release.keystore")"
 
       - name: Build APK
         run: |
-          # NDK_HOME 已在 Setup Android env 步骤写入 GITHUB_ENV
           echo "NDK_HOME=$NDK_HOME"
           npx tauri android init --ci || true
           npx tauri android build --target aarch64 --split-per-abi
@@ -129,9 +133,8 @@ jobs:
             "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" verify "$OUT"
           echo "APK: $OUT ($(stat -c%s "$OUT") bytes)"
-          echo "APK_NAME=$OUT" >> $GITHUB_ENV
 
-      - name: Upload APK artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
@@ -141,27 +144,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: 油价 v${{ steps.ver.outputs.version }}
+          name: Youjia v${{ steps.ver.outputs.version }}
           tag_name: ${{ github.ref_name }}
           draft: false
           prerelease: false
           files: youjia-*-arm64.apk
           body: |
-            ## 油价 v${{ steps.ver.outputs.version }}
+            ## Youjia v${{ steps.ver.outputs.version }}
 
-            ### 安装
-            下载 `youjia-${{ steps.ver.outputs.version }}-arm64.apk` 安装（Android 7.0+，arm64 设备）。
+            Download `youjia-${{ steps.ver.outputs.version }}-arm64.apk`
+            (Android 7.0+, arm64 devices).
 
-            ### 更新说明
-            见提交记录。
-
-  # ============================================================
-  # iOS：仅当配好证书时才构建
-  # ============================================================
   ios:
     name: Build iOS (optional)
     runs-on: macos-latest
-    # 没有 Apple 证书时跳过整个 job，不影响 Android 发布
     if: ${{ vars.ENABLE_IOS_BUILD == 'true' }}
     steps:
       - uses: actions/checkout@v4
@@ -193,16 +189,16 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"
           fi
-          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Set version
         run: |
           node -e "
-          const fs=require('fs');
-          const p='src-tauri/tauri.conf.json';
-          const c=JSON.parse(fs.readFileSync(p,'utf8'));
-          c.version='${{ steps.ver.outputs.version }}';
-          fs.writeFileSync(p, JSON.stringify(c,null,2)+'\n');
+          const fs = require('fs');
+          const p = 'src-tauri/tauri.conf.json';
+          const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+          c.version = '${{ steps.ver.outputs.version }}';
+          fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
           "
 
       - name: Install Apple certificate
@@ -223,7 +219,8 @@ jobs:
             -P "$IOS_CERT_PASS" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "$PROVISION_BASE64" | base64 -d \
@@ -235,7 +232,7 @@ jobs:
           npx tauri ios init --ci || true
           npx tauri ios build --export-method app-store-connect
 
-      - name: Upload IPA artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
