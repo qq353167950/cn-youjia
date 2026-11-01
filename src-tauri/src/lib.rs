@@ -29,6 +29,18 @@ pub struct AppCache {
     inner: Mutex<HashMap<String, (u64, ProvincePrice)>>,
     /// 全国柴油表缓存：(时间戳, 省名 -> 标号 -> 价格)
     diesel: Mutex<Option<(u64, HashMap<String, HashMap<String, f64>>)>>,
+    /// 节假日缓存：年份 -> (拉取时间戳, 数据)
+    holidays: Mutex<HashMap<i32, (u64, HolidayYear)>>,
+}
+
+/// 某一年的节假日安排，供前端推算成品油调价周期使用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolidayYear {
+    pub year: i32,
+    /// 法定放假日（含调休放假），ymd 格式
+    pub off: Vec<String>,
+    /// 调休补班日（周末但要上班），ymd 格式
+    pub makeup: Vec<String>,
 }
 
 impl AppCache {
@@ -36,8 +48,10 @@ impl AppCache {
         Self {
             inner: Mutex::new(HashMap::new()),
             diesel: Mutex::new(None),
+            holidays: Mutex::new(HashMap::new()),
         }
     }
+
 
     /// 取柴油表，命中缓存时直接返回，否则拉取并写入
     async fn diesel_table(
@@ -560,6 +574,93 @@ async fn get_prices(
         .collect())
 }
 
+/// 从公开接口拉取某一年的节假日安排。
+///
+/// 数据源返回形如：
+///   {"code":0,"holiday":{"01-01":{"holiday":true,"date":"2026-01-01",...},
+///                        "01-04":{"holiday":false,"date":"2026-01-04",...}}}
+/// holiday=true 是放假，false 是调休补班。
+async fn fetch_holidays(client: &reqwest::Client, year: i32) -> Option<HolidayYear> {
+    let url = format!("https://timor.tech/api/holiday/year/{}", year);
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, UA)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        return None;
+    }
+    let map = v.get("holiday")?.as_object()?;
+
+    let mut off: Vec<String> = Vec::new();
+    let mut makeup: Vec<String> = Vec::new();
+    for (_k, item) in map.iter() {
+        let date = match item.get("date").and_then(|d| d.as_str()) {
+            Some(d) => d.to_string(),
+            None => continue,
+        };
+        match item.get("holiday").and_then(|h| h.as_bool()) {
+            Some(true) => off.push(date),
+            Some(false) => makeup.push(date),
+            None => {}
+        }
+    }
+    off.sort();
+    makeup.sort();
+
+    // 空数据视为失败：宁可让前端降级，也不要把"没有节假日"当真
+    if off.is_empty() {
+        return None;
+    }
+
+    Some(HolidayYear {
+        year,
+        off,
+        makeup,
+    })
+}
+
+/// 节假日缓存有效期：24 小时。
+/// 全年放假安排一年只公布一次，24 小时内不会变；失败时不写缓存，
+/// 下次调用会重试（避免一次网络抖动就让整年不可用）。
+const HOLIDAY_TTL_SECS: u64 = 24 * 3600;
+
+#[tauri::command]
+async fn get_holidays(
+    state: tauri::State<'_, AppCache>,
+    year: i32,
+) -> Result<HolidayYear, String> {
+    // 合理年份范围，避免被传入离谱值触发无意义请求
+    if !(2020..=2100).contains(&year) {
+        return Err(format!("不支持的年份: {}", year));
+    }
+
+    let now = now_secs();
+    if let Ok(guard) = state.holidays.lock() {
+        if let Some((ts, data)) = guard.get(&year) {
+            if now.saturating_sub(*ts) <= HOLIDAY_TTL_SECS {
+                return Ok(data.clone());
+            }
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let fresh = fetch_holidays(&client, year)
+        .await
+        .ok_or_else(|| format!("{}年节假日数据获取失败", year))?;
+
+    if let Ok(mut guard) = state.holidays.lock() {
+        guard.insert(year, (now, fresh.clone()));
+    }
+    Ok(fresh)
+}
+
 #[tauri::command]
 fn list_regions() -> Vec<(String, String)> {
     REGIONS
@@ -575,6 +676,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_price,
             get_prices,
+            get_holidays,
             list_regions
         ])
         .run(tauri::generate_context!())

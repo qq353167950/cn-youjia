@@ -48,6 +48,21 @@ enum OilWidgetBridge {
         }
     }
 
+    /// 保存调价倒计时文案并刷新小组件。
+    /// - Parameter text: 形如「调价 12/8 · 14天」，空串表示不显示
+    static func saveAdjust(_ text: String) {
+        guard let d = defaults else { return }
+        let v = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let old = d.string(forKey: "widget.adjust") ?? ""
+        d.set(v, forKey: "widget.adjust")
+
+        if old != v {
+            if #available(iOS 14.0, *) {
+                WidgetCenter.shared.reloadTimelines(ofKind: "OilWidget")
+            }
+        }
+    }
+
     /// 主动要求小组件刷新（例如主 App 拿到新价格时）
     static func reload() {
         if #available(iOS 14.0, *) {

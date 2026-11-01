@@ -132,6 +132,28 @@ class MainActivity : TauriActivity() {
       }
     }
 
+    /**
+     * 前端把调价倒计时文案算好后推过来（小组件进程拿不到节假日表，算不了）。
+     * 文案例：「调价 12/8 · 14天」「调价 今日24时」。
+     * 传空字符串表示不显示。
+     */
+    @JavascriptInterface
+    fun setAdjust(text: String?) {
+      val v = (text ?: "").trim()
+      val sp = ctx.getSharedPreferences("yj_widget", MODE_PRIVATE)
+      val old = sp.getString("adjust", null) ?: ""
+      sp.edit().putString("adjust", v).apply()
+
+      // 文案变了才重绘，避免无谓刷新
+      if (old != v) {
+        try {
+          OilWidgetProvider.requestRenderOnly(ctx.applicationContext)
+        } catch (t: Throwable) {
+          Log.w("YoujiaBridge", "render failed: ${t.message}")
+        }
+      }
+    }
+
     @JavascriptInterface
     fun setTheme(theme: String?) {
       ctx.applySystemBarStyle(theme != "light")

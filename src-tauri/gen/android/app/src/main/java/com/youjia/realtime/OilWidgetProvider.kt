@@ -44,6 +44,21 @@ class OilWidgetProvider : AppWidgetProvider() {
         }
 
         /**
+         * 只重绘，不联网。用于前端推送了新文案（如调价倒计时）后的即时刷新。
+         * 不拉网络，避免用户切城市时产生多余请求。
+         */
+        fun requestRenderOnly(context: Context) {
+            val app = context.applicationContext
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                val mgr = AppWidgetManager.getInstance(app)
+                val ids = mgr.getAppWidgetIds(
+                    android.content.ComponentName(app, OilWidgetProvider::class.java)
+                )
+                ids.forEach { id -> render(app, mgr, id, fromCache = true) }
+            }
+        }
+
+        /**
          * 真正的刷新体：拉数据 → 写缓存 → 重绘所有实例。
          * 放在 companion 里，实例方法和外部调用都能直接访问。
          * 调用方需保证运行在后台线程。
@@ -57,6 +72,8 @@ class OilWidgetProvider : AppWidgetProvider() {
                     GRADES.forEach { g ->
                         prices[g]?.let { p.putString(g, it.toString()) }
                     }
+                    // 更新时间不再展示（右侧位置改为调价倒计时），
+                    // 仍记录一份便于排障。
                     p.putString(
                         "updated",
                         SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date())
@@ -146,13 +163,16 @@ class OilWidgetProvider : AppWidgetProvider() {
             val p = prefs(context)
             val slug = p.getString("slug", "beijing") ?: "beijing"
             val cityName = p.getString("cityName", "北京") ?: "北京"
-            val updated = p.getString("updated", null)
+            // 右侧改为显示调价倒计时（由前端算好推过来）。
+            // 没有数据时留空，避免显示「下拉刷新」这种无意义文案。
+            val adjust = p.getString("adjust", "") ?: ""
 
             val views = RemoteViews(context.packageName, R.layout.widget_oil)
             views.setTextViewText(R.id.w_city, cityName)
-            views.setTextViewText(
+            views.setTextViewText(R.id.w_time, adjust)
+            views.setViewVisibility(
                 R.id.w_time,
-                if (updated != null) "更新 $updated" else "下拉刷新"
+                if (adjust.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
             )
 
             val idMap = mapOf(

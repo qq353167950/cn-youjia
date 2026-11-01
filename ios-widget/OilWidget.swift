@@ -38,6 +38,8 @@ struct OilEntry: TimelineEntry {
     let fuels: [FuelPrice]
     /// 无网络、也无缓存时为 true
     let isStale: Bool
+    /// 调价倒计时文案，由主 App 算好后写入共享存储（小组件进程算不了）
+    let adjustText: String
 }
 
 // MARK: - App Group 共享存储
@@ -60,6 +62,11 @@ enum SharedStore {
 
     static var citySlug: String {
         defaults?.string(forKey: slugKey) ?? "beijing"
+    }
+
+    /// 调价倒计时文案，由主 App 写入；没有则为空串
+    static var adjustText: String {
+        defaults?.string(forKey: "widget.adjust") ?? ""
     }
 
     /// 读上次缓存的价格（断网兜底）
@@ -163,7 +170,8 @@ struct OilProvider: TimelineProvider {
                 FuelPrice(grade: "98#", price: 10.67),
                 FuelPrice(grade: "0#", price: 8.36),
             ],
-            isStale: false
+            isStale: false,
+            adjustText: SharedStore.adjustText
         )
     }
 
@@ -175,7 +183,8 @@ struct OilProvider: TimelineProvider {
                 date: Date(),
                 cityName: SharedStore.cityName,
                 fuels: cached.isEmpty ? placeholder(in: context).fuels : cached,
-                isStale: cached.isEmpty
+                isStale: cached.isEmpty,
+                adjustText: SharedStore.adjustText
             )
         )
     }
@@ -198,7 +207,8 @@ struct OilProvider: TimelineProvider {
                 date: Date(),
                 cityName: SharedStore.cityName,
                 fuels: fuels,
-                isStale: stale
+                isStale: stale,
+                adjustText: SharedStore.adjustText
             )
 
             // 每 30 分钟刷新一次（系统会酌情合并，不会精确到点）
@@ -241,7 +251,13 @@ struct OilWidgetView: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
                 Spacer()
-                if entry.isStale {
+                // 右侧改为调价倒计时（由主 App 算好写入共享存储）
+                if !entry.adjustText.isEmpty {
+                    Text(entry.adjustText)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                } else if entry.isStale {
                     Text("离线")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(.orange)

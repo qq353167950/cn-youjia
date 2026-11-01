@@ -87,6 +87,10 @@ async function mockInvoke(cmd, args) {
   if (cmd === "get_prices") {
     return args.slugs.map((s) => mk(s, REGION_NAME[s] || "未知"));
   }
+  if (cmd === "get_holidays") {
+    // 浏览器预览没有后端，用空白表占位：此时调价条会隐藏而非显示错日期
+    return { year: args.year, off: [], makeup: [] };
+  }
   if (cmd === "list_regions") {
     return Object.entries(REGION_NAME);
   }
@@ -328,10 +332,15 @@ async function loadPrice(slug, { silent = false } = {}) {
     const data = await invoke("get_price", { slug });
     state.cache[slug] = data;
     recordHistory(data);
+    // 观察真实价格变化，必要时把调价锚点推进到今天。
+    // 返回 true 表示锚点被改写过，此时调价日期变了，要同步给小组件。
+    const anchorMoved = detectAdjustment(data);
     STORE.write(STORE.cache, state.cache);
     state.loading = false;
     state.refreshing = false;
     render();
+    // 锚点被校正后，小组件上的倒计时需要跟着更新
+    if (anchorMoved) syncCityToWidget(state.current);
     return data;
   } catch (e) {
     state.loading = false;
@@ -392,6 +401,243 @@ async function loadCompare() {
       delete compareLoading[s];
     });
   }
+}
+/* ===================================================================
+ * 成品油调价周期
+ *
+ * 规则（发改委成品油价格形成机制）：
+ *   - 每 10 个「工作日」为一个计价周期，届满调整一次
+ *   - 周末与法定节假日不计入工作日
+ *   - 调休补班日算工作日（这一条最容易漏，漏了会导致日期偏差）
+ *
+ * 节假日数据**不硬编码**，一律由后端从公开 API 拉取（见 Rust 侧
+ * fetch_holidays）。原因：每年放假安排都不同，写死一年后必然失准，
+ * 且失准时不会报错、只会静默偏几天，很难被发现。
+ *
+ * 局限：本模块只推算"理论上的调价日"。若某周期内涨跌幅不足
+ * 50 元/吨，发改委会"搁浅"不调，实际调价日随之后移 —— 这一点
+ * 无法预先算出，只能事后校正。
+ *
+ * 自动校正：调价日 24 时后价格若真的变了，说明该日确实调价了，
+ * 就把这一天的价格指纹记为"调价证据"，并把它作为新的推算锚点。
+ * 这样即便中间某次搁浅、整体后移，后续推算也会自动对齐，
+ * 不再依赖人工维护的常量。
+ * =================================================================== */
+
+/** 节假日表：{ off:Set<ymd>, makeup:Set<ymd> }，由后端填充 */
+let holidayTable = { off: new Set(), makeup: new Set(), year: null };
+
+/**
+ * 已知的最近一次调价日（锚点）。
+ *
+ * 这是"冷启动"用的初始值：在 App 还没观察到任何一次真实调价之前，
+ * 用它作为推算起点。一旦 detectAdjustment() 观察到真实调价，
+ * 会自动把锚点推进到那一天并存盘，此后不再依赖这个常量。
+ */
+const SEED_ANCHOR = "2025-11-24";
+
+/** 运行时锚点：优先用本地记录的、已确认的调价日 */
+let adjustAnchor = STORE.read("yj.adjustAnchor", null) || SEED_ANCHOR;
+
+const CYCLE_WORKDAYS = 10;
+
+
+function ymd(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+function parseYmd(s) {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/** 某天是否为工作日（周末补班也算，法定假日不算） */
+function isWorkday(d) {
+  const s = ymd(d);
+  if (holidayTable.makeup.has(s)) return true;
+  if (holidayTable.off.has(s)) return false;
+  const w = d.getDay();
+  return w !== 0 && w !== 6;
+}
+
+/**
+ * 加载指定年份的节假日数据。
+ *
+ * 数据由后端（Rust）从公开接口拉取并缓存到磁盘，一年只需成功一次。
+ * 加载失败时保持空表 —— 此时只有周末被排除、法定假日被当成工作日，
+ * 算出的日期会偏早，因此 UI 会按"未经校準"降级显示，不冒充精确值。
+ */
+async function loadHolidays(year) {
+  if (holidayTable.year === year) return true;
+  try {
+    const invoke = await getInvoke();
+    const data = await invoke("get_holidays", { year });
+    if (!data || !Array.isArray(data.off)) return false;
+    holidayTable = {
+      off: new Set(data.off),
+      makeup: new Set(data.makeup || []),
+      year: data.year || year,
+    };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 当前年份和次年都需要：跨年周期会用到下一年的假期 */
+async function ensureHolidayData(now) {
+  const y = (now || new Date()).getFullYear();
+  const okCur = await loadHolidays(y);
+  await loadHolidays(y + 1); // 次年失败不影响今年
+  return okCur;
+}
+
+/** 从 start 起往后数 n 个工作日，返回那一天的 Date */
+function addWorkdays(start, n) {
+  const d = new Date(start.getTime());
+  let count = 0;
+  let guard = 0;
+  while (count < n && guard < 400) {
+    d.setDate(d.getDate() + 1);
+    guard++;
+    if (isWorkday(d)) count++;
+  }
+  return d;
+}
+
+/**
+ * 在锚点之后连续推进，找到"今天及以后"的第一个调价日。
+ *
+ * 从锚点逐周期推进（而不是从今天倒推），这样跨年、跨多个
+ * 周期时结果依然连续一致，不会因为"最近的调价日是谁"而抖动。
+ */
+function nextAdjustDate(now, anchor) {
+  const base = now || new Date();
+  const today = new Date(base.getFullYear(), base.getMonth(), base.getDate());
+  let cursor = parseYmd(anchor || adjustAnchor || SEED_ANCHOR);
+  let guard = 0;
+  while (guard < 400) {
+    const next = addWorkdays(cursor, CYCLE_WORKDAYS);
+    if (next.getTime() >= today.getTime()) return next;
+    cursor = next;
+    guard++;
+  }
+  return addWorkdays(cursor, CYCLE_WORKDAYS);
+}
+
+/**
+ * 给 UI 用的调价信息。
+ * reliable 表示当年节假日数据是否真的取到了 —— 取不到时降级展示，
+ * 不把未经校準的日期当成精确值给用户。
+ */
+function adjustInfo(now) {
+  const base = now || new Date();
+  const d = nextAdjustDate(base);
+  return {
+    date: d,
+    days: daysUntil(d, base),
+    reliable: holidayTable.year === base.getFullYear(),
+  };
+}
+
+/** 距下一次调价还有几天（0 表示就是今天） */
+function daysUntil(date, now) {
+  const a = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const b0 = now || new Date();
+  const b = new Date(b0.getFullYear(), b0.getMonth(), b0.getDate());
+  return Math.round((a.getTime() - b.getTime()) / 86400000);
+}
+
+/* ---------- 调价自动校正 ---------- */
+
+/**
+ * 判断某次调价是否真的发生了，并把锚点推进过去。
+ *
+ * 原理：调价日 24 时后价格若变化，说明这天确实调价了。
+ * 我们用"价格指纹"（各油品价格的拼接）来判定：
+ *   - 上次记录的指纹 != 本次指纹  → 价格变了，是真实调价
+ *   - 指纹相同                    → 本周期搁浅，锚点不动
+ *
+ * 这样即便中间搁浅导致整体后移，下一轮推算是从"最近一次真实调价日"
+ * 出发的，误差不会累积。
+ *
+ * 注意只接受"今天及以前"的日期作为新锚点，避免把未来日期写进锚点。
+ */
+function fingerprintOf(priceData) {
+  if (!priceData || !Array.isArray(priceData.fuels)) return null;
+  return priceData.fuels
+    .map((f) => f.grade + ":" + Number(f.price).toFixed(2))
+    .sort()
+    .join("|");
+}
+
+/**
+ * 在成功拉到某城市最新价格后调用。
+ *
+ * @param priceData 后端返回的 {slug, fuels, updated_at}
+ */
+function detectAdjustment(priceData) {
+  const fp = fingerprintOf(priceData);
+  if (!fp) return false;
+
+  const today = ymd(new Date());
+  const saved = STORE.read("yj.priceFingerprint", null);
+
+  // 首次运行：只记录基线，不做判定（否则会误判成一次调价）
+  if (!saved || !saved.fp || !saved.d) {
+    STORE.write("yj.priceFingerprint", { fp, d: today });
+    return false;
+  }
+
+  if (saved.fp === fp) {
+    // 价格没变：更新观测日期，但不动锚点
+    STORE.write("yj.priceFingerprint", { fp, d: today });
+    return false;
+  }
+
+  // 价格变了。判定是否为一次真实调价：
+  // 找一个落在「上次观测日(不含) ~ 今天(含)」区间内的调价周期点。
+  // 只要区间内跨过了周期边界，就认为这段时间里确实调过价 ——
+  // 这样无论锚点是否过期、中间搁浅几次，都能收敛到正确日期。
+  const from = parseYmd(saved.d);
+  const toDate = parseYmd(today);
+  const cyclePoint = firstCycleWithin(from, toDate);
+
+  if (!cyclePoint) {
+    // 区间内没有周期边界：价格波动属于周期内的正常调整，不算调价
+    STORE.write("yj.priceFingerprint", { fp, d: today });
+    return false;
+  }
+
+  // 确认调价：锚点推进到该周期点（而非今天，保留真实的周期位置）
+  const prevAnchor = adjustAnchor;
+  adjustAnchor = ymd(cyclePoint);
+  STORE.write("yj.adjustAnchor", adjustAnchor);
+  STORE.write("yj.priceFingerprint", { fp, d: today });
+  return adjustAnchor !== prevAnchor;
+}
+
+/**
+ * 找出落在 (from, to] 区间内的第一个调价周期点。
+ *
+ * 从当前锚点逐周期推进；一旦越过 to 就停止。区间内若存在周期点，
+ * 返回最早的那个（真正的调价日），否则返回 null。
+ *
+ * 用区间判定而不是"今天 vs 远期目标"，好处是锚点过期也能自动收敛：
+ * 哪怕锚点是半年前的，只要这期间跨过了周期边界，就会把锚点拉回来。
+ */
+function firstCycleWithin(from, to) {
+  let cursor = parseYmd(adjustAnchor || SEED_ANCHOR);
+  let guard = 0;
+  while (guard < 500) {
+    const next = addWorkdays(cursor, CYCLE_WORKDAYS);
+    if (next.getTime() > to.getTime()) return null; // 越过终点，区间内没有
+    if (next.getTime() > from.getTime()) return next; // 落在区间内
+    cursor = next;
+    guard++;
+  }
+  return null;
 }
 
 /**
@@ -638,8 +884,6 @@ function render() {
   `;
 
   bindEvents();
-
-  bindEvents();
 }
 
 function renderTopbar(data) {
@@ -700,6 +944,8 @@ function renderHome(data, fuels, active, grade) {
       <span class="live-badge"><i class="pulse"></i>LIVE</span>
     </div>
 
+    ${renderAdjustBar()}
+
     <div class="fuel-grid">
       ${ordered
         .map(function (g, i) {
@@ -740,6 +986,38 @@ function renderHome(data, fuels, active, grade) {
     </div>
 
     <div class="home-foot">更新于 ${timeAgo(data.updated_at)} · 省级挂牌价，以加油站为准</div>`;
+}
+
+/**
+ * 调价提示条：显示下一次预计调价日。
+ * 文案：下次预计调价 12 月 8 日 24 时 · 还有 14 天
+ *   - 今天是调价日 → 下次预计调价 今日 24 时 · 今晚
+ *   - 明天 → 下次预计调价 明日 24 时 · 还有 1 天
+ *
+ * reliable=false（当年节假日数据没取到）时整条不显示，
+ * 不拿未经校準的日期冒充精确值。
+ */
+function renderAdjustBar() {
+  const base = new Date();
+  if (holidayTable.year !== base.getFullYear()) return "";
+
+  const info = adjustInfo(base);
+  const d = info.date;
+  const dateText = d.getMonth() + 1 + " 月 " + d.getDate() + " 日";
+
+  let when;
+  if (info.days === 0) when = "今日 24 时";
+  else if (info.days === 1) when = "明日 24 时";
+  else when = dateText + " 24 时";
+
+  const countdown =
+    info.days <= 0 ? "今晚" : "还有 " + info.days + " 天";
+
+  return `<div class="adjust-bar">
+      <span class="adj-icon">${ICON.clock}</span>
+      <span class="adj-text">下次预计调价 <b>${when}</b></span>
+      <span class="adj-sub">· ${countdown}</span>
+    </div>`;
 }
 
 /* ================= 计算器弹窗 ================= */
@@ -1655,7 +1933,8 @@ function switchCity(slug) {
 }
 
 /**
- * 把当前城市同步给原生层，供桌面小组件使用。
+ * 把当前城市与调价信息同步给原生层，供桌面小组件使用。
+ *
  * 小组件跑在 AppWidget 进程里，读不到 WebView 的 localStorage，
  * 因此通过 MainActivity 注入的 YoujiaNative 桥接写入 SharedPreferences。
  * 非 Android 环境（浏览器预览）下该对象不存在，静默跳过。
@@ -1663,12 +1942,37 @@ function switchCity(slug) {
 function syncCityToWidget(slug) {
   try {
     var bridge = window.YoujiaNative;
-    if (bridge && typeof bridge.setCity === "function") {
+    if (!bridge) return;
+
+    if (typeof bridge.setCity === "function") {
       bridge.setCity(slug, REGION_NAME[slug] || slug);
+    }
+
+    // 调价倒计时：小组件自己算不了（拿不到节假日表），
+    // 由前端算好后直接推过去，文案尽量短。
+    if (typeof bridge.setAdjust === "function") {
+      var adj = widgetAdjustText();
+      bridge.setAdjust(adj, adj ? adj : "");
     }
   } catch (e) {
     /* 忽略：不影响主流程 */
   }
+}
+
+/**
+ * 小组件上显示的调价文案（精简版）。
+ * 例：调价 12/8 · 14天 / 调价 今日24时 / （空字符串表示不显示）
+ */
+function widgetAdjustText() {
+  const base = new Date();
+  if (holidayTable.year !== base.getFullYear()) return "";
+  const info = adjustInfo(base);
+  if (!info.date) return "";
+  const d = info.date;
+  const md = d.getMonth() + 1 + "/" + d.getDate();
+  if (info.days > 1) return "调价 " + md + " · " + info.days + "天";
+  if (info.days === 1) return "调价 明日24时";
+  return "调价 今日24时";
 }
 
 /* ===================================================================
@@ -1685,6 +1989,61 @@ function showFatal(err) {
     "</div>";
 }
 
+/* ===================================================================
+ * 智能刷新
+ *
+ * 背景：油价一天至多变一次（调价日 24 时生效）。原先每 5 分钟拉一次，
+ * 绝大部分请求拿到的都是同一份数据，白白耗流量和电。
+ *
+ * 策略：按"距离调价还有多久"分级。
+ *   - 平常：每 60 分钟一次，足以覆盖手动改价等异常情况
+ *   - 调价日当天（及前一天）：每 15 分钟一次，及时反映新价格
+ *   - 另外：切回前台 / 从后台唤醒时，若数据超过 30 分钟立即补一次
+ *
+ * 后端仍有 10 分钟缓存兜底，前端再频繁也不会真的打穿到源站。
+ * =================================================================== */
+
+const REFRESH_NORMAL_MS = 60 * 60 * 1000; // 1 小时
+const REFRESH_NEAR_MS = 15 * 60 * 1000;   // 调价日前后 15 分钟
+const REFRESH_STALE_MS = 30 * 60 * 1000;  // 前台唤醒时判定"太旧"的阈值
+
+let refreshTimer = null;
+let lastLoadAt = Date.now();
+
+/** 当前该用哪种刷新间隔 */
+function currentRefreshInterval() {
+  const based = new Date();
+  if (holidayTable.year !== based.getFullYear()) return REFRESH_NORMAL_MS;
+  const info = adjustInfo(based);
+  // 调价日当天或前一天 → 加密刷新
+  return info.days <= 1 ? REFRESH_NEAR_MS : REFRESH_NORMAL_MS;
+}
+
+/** 重新排定下一次自动刷新（间隔可能随日期变化） */
+function scheduleNextRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  const delay = currentRefreshInterval();
+  refreshTimer = setTimeout(function () {
+    loadPrice(state.current, { silent: true });
+    lastLoadAt = Date.now();
+    scheduleNextRefresh();
+  }, delay);
+}
+
+function setupSmartRefresh() {
+  lastLoadAt = Date.now();
+  scheduleNextRefresh();
+
+  // 回到前台：数据太旧就补一次（App 常驻后台时定时器可能被系统节流）
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible") return;
+    if (Date.now() - lastLoadAt < REFRESH_STALE_MS) return;
+    loadPrice(state.current, { silent: true });
+    lastLoadAt = Date.now();
+    scheduleNextRefresh();
+  });
+}
+
 async function boot() {
   applyTheme();
   // 初始化对比列表（首次使用时把首页当前城市放进去）
@@ -1693,18 +2052,25 @@ async function boot() {
   syncCityToWidget(state.current);
   try {
     render();
+    // 节假日表与油价并行拉取：它决定调价提示条和刷新频率，
+    // 失败也不阻塞主流程（renderAdjustBar 会自动隐藏）。
+    const holidaysReady = ensureHolidayData().catch(() => false);
     // 首屏先渲染缓存，用户立刻看到数据（0 网络等待）
     await loadPrice(state.current, { silent: !!state.cache[state.current] });
+    // 节假日到位后重绘一次，把调价提示条显示出来，
+    // 同时把算好的调价文案推给桌面小组件 —— boot 开头那次推送
+    // 发生在节假日加载之前，adjust 必然是空的，这里必须补一次。
+    if (await holidaysReady) {
+      render();
+      syncCityToWidget(state.current);
+    }
     // 顺带预取对比列表的数据，切换 tab 时无需再等
     loadCompare();
 
     // 首屏数据就绪后，如果计算器已打开且有输入，重算一次
     if (state.calcOpen) updateCalcResult();
 
-    // 每 5 分钟自动刷新一次当前城市
-    setInterval(function () {
-      loadPrice(state.current, { silent: true });
-    }, 5 * 60 * 1000);
+    setupSmartRefresh();
   } catch (e) {
     showFatal(e);
   }
