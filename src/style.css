@@ -381,7 +381,15 @@ body {
   display: flex; align-items: center; gap: 5px; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.cc-auto { width: 5px; height: 5px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 6px var(--accent-2); flex-shrink: 0; }
+/* 「该城市不供应此油品」的占位文案：弱化但可读，且不能像加载中那样闪烁 */
+.cc-na {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  letter-spacing: .02em;
+}
+.cmp-card.na { opacity: .62; }
+.cmp-card.na .cc-foot { color: var(--text-tertiary); }
 .cc-del {
   width: 22px; height: 22px; display: grid; place-items: center;
   border-radius: 7px; border: none; background: transparent;

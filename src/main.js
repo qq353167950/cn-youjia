@@ -174,18 +174,17 @@ const state = {
   current: STORE.read(STORE.current, "beijing"),
 
   /**
-   * 对比列表：
-   *   compareList  —— 用户看到并维护的城市列表（有序）
-   *   autoSlug     —— 当前「跟随首页」的那个城市。为空表示用户已手动删掉它，
-   *                   此时首页再切城市也不会自动加回来。
+   * 对比列表：完全由用户手动维护（有序）。
    *
-   * 规则：
-   *   1) 首页切换城市时，若 autoSlug 非空，则把旧的跟随项替换为新城市；
-   *   2) 用户手动添加到列表的城市永远不动；
-   *   3) 用户删掉跟随项后 autoSlug 置空，之后切首页不再插入。
+   * 早期版本有一个 autoSlug「跟随首页」机制：首页切城市时会把列表里
+   * 某个"跟随项"替换成新城市。这导致用户在对比页辛苦挑好的城市，
+   * 回首页切一次城市就被顶掉了，只剩首页当前城市。
+   *
+   * 现在彻底解耦：首页选城市只影响首页，绝不改动对比列表。
+   * 对比列表只在两种情况下变化 —— 用户点「添加对比城市」或点卡片上的删除。
+   * （旧的 yj.autoSlug 键不再读写，残留值不影响使用。）
    */
   compareList: STORE.read("yj.compareList", []),
-  autoSlug: STORE.read("yj.autoSlug", null),
 
   cache: STORE.read(STORE.cache, {}),
   history: STORE.read(STORE.history, {}),
@@ -210,26 +209,10 @@ const state = {
 
 function saveCompare() {
   STORE.write("yj.compareList", state.compareList);
-  STORE.write("yj.autoSlug", state.autoSlug);
-}
-
-/** 首页切换城市 → 同步「跟随项」 */
-function syncCompareWithCurrent(slug) {
-  if (!state.autoSlug) return; // 跟随项已被用户删除，不再自动插入
-  if (state.autoSlug === slug) return;
-
-  var idx = state.compareList.indexOf(state.autoSlug);
-  if (idx >= 0) {
-    state.compareList[idx] = slug;
-  } else {
-    state.compareList.unshift(slug);
-  }
-  // 去重（新城市可能已在手动列表里）
-  state.compareList = state.compareList.filter(function (s, i, a) {
-    return a.indexOf(s) === i;
-  });
-  state.autoSlug = slug;
-  saveCompare();
+  // 清掉旧版本的跟随项残留键，避免后续版本误读
+  try {
+    localStorage.removeItem("yj.autoSlug");
+  } catch {}
 }
 
 /** 用户从列表里删除某城市 */
@@ -237,10 +220,6 @@ function removeCompareCity(slug) {
   state.compareList = state.compareList.filter(function (s) {
     return s !== slug;
   });
-  if (state.autoSlug === slug) {
-    // 删掉的是跟随项 → 关闭跟随，之后首页切换不影响列表
-    state.autoSlug = null;
-  }
   saveCompare();
 }
 
@@ -249,25 +228,19 @@ function addCompareCity(slug) {
   if (state.compareList.indexOf(slug) < 0) {
     state.compareList.push(slug);
   }
-  // 手动添加不改变 autoSlug
   saveCompare();
 }
 
-/** 初始化：首次使用时把首页当前城市放进列表 */
+/**
+ * 初始化对比列表。
+ *
+ * 只在列表为空时放一次首页城市作为种子，之后完全交给用户维护。
+ * 这里不做"跟随首页"：首页切城市不会再改动对比列表。
+ */
 function initCompareList() {
   if (state.compareList.length === 0) {
     state.compareList = [state.current];
-    state.autoSlug = state.current;
     saveCompare();
-    return;
-  }
-  // 兼容老版本：旧数据里没有 autoSlug 字段时，默认跟随首页
-  if (state.autoSlug === null && state.compareList.length > 0) {
-    // 若列表里已有当前城市，视为跟随它
-    if (state.compareList.indexOf(state.current) >= 0) {
-      state.autoSlug = state.current;
-      saveCompare();
-    }
   }
 }
 
@@ -366,9 +339,16 @@ function silentRefresh(slug) {
  * 对比页 = 收藏城市的横向比较，所以数据源就是 favs。
  * 只请求本地缺失的城市，命中缓存时零网络开销。
  */
+// 记录正在请求中的城市，避免渲染每触发一次就重新拉一遍
+const compareLoading = {};
 async function loadCompare() {
-  const slugs = state.compareList.filter((s) => !state.cache[s]);
+  const slugs = state.compareList.filter(
+    (s) => !state.cache[s] && !compareLoading[s]
+  );
   if (slugs.length === 0) return;
+  slugs.forEach((s) => {
+    compareLoading[s] = true;
+  });
   try {
     const invoke = await getInvoke();
     const list = await invoke("get_prices", { slugs });
@@ -380,6 +360,10 @@ async function loadCompare() {
     render();
   } catch {
     /* 对比数据失败不打断主流程 */
+  } finally {
+    slugs.forEach((s) => {
+      delete compareLoading[s];
+    });
   }
 }
 
@@ -405,11 +389,34 @@ function timeAgo(ts) {
   return `${Math.floor(diff / 86400)} 天前`;
 }
 
-/** 计算某油品的日环比涨跌 */
+/**
+ * 计算某油品的日环比涨跌。
+ *
+ * 基准必须显式取「今天之前最近一天」的价格，不能再用 series[len-2]：
+ * recordHistory 同一天同油品是覆盖写，"今天"永远只占 1 条，
+ * 一旦该城市今天之前没有记录（首次打开、新装、切到新城市），
+ * series 长度就恒为 1，涨跌标记永远出不来。
+ * 而靠下标取点还会被"今天到底写没写进去"的时序影响 ——
+ * 切换城市会改变写入时机，于是标记时有时无。
+ *
+ * 改为按日期取基准后，只要历史里有更早的一天，标记就稳定存在，
+ * 与切换城市、刷新次数、写入顺序全部解耦。
+ */
 function deltaFor(slug, grade, currentVal) {
   const series = getSeries(slug, grade);
-  if (series.length < 2) return null;
-  const prev = series[series.length - 2].v;
+  if (series.length === 0) return null;
+
+  const today = new Date().toISOString().slice(0, 10);
+  // 取严格早于今天的最后一条作为对比基准
+  let prev = null;
+  for (let i = series.length - 1; i >= 0; i--) {
+    if (series[i].d < today) {
+      prev = series[i].v;
+      break;
+    }
+  }
+  if (prev === null) return null;
+
   const d = currentVal - prev;
   if (Math.abs(d) < 0.005) return { dir: "flat", val: 0 };
   return { dir: d > 0 ? "up" : "down", val: Math.abs(d) };
@@ -1015,11 +1022,12 @@ function renderComparePage() {
           return x.grade === grade;
         });
       const name = REGION_NAME[slug] || slug;
-      const isAuto = state.autoSlug === slug;
       const isCurrent = state.current === slug;
+      // d 有值 = 该城市数据已到手；d 为空 = 还在加载
+      const loadedCity = !!d;
 
-      // 未加载完成
-      if (!f) {
+      // 情况一：城市数据还没回来 → 才是真正的「加载中」
+      if (!loadedCity) {
         return `<div class="cmp-card loading" style="animation-delay:${i * 40}ms">
             <span class="cc-glow" style="background:${gradeColorCss(grade)}"></span>
             <div class="cc-top">
@@ -1028,6 +1036,20 @@ function renderComparePage() {
             </div>
             <div class="cc-price"><span class="cc-loading">—</span></div>
             <div class="cc-foot">加载中…</div>
+          </div>`;
+      }
+
+      // 情况二：数据已到，但这个城市不供应该油品（如部分地区无 -10#）
+      // 不能显示「加载中」，否则用户会一直等一个永远不会来的数据。
+      if (!f) {
+        return `<div class="cmp-card na" style="animation-delay:${i * 40}ms">
+            <span class="cc-glow" style="background:${gradeColorCss(grade)}"></span>
+            <div class="cc-top">
+              <span class="cc-name">${name}</span>
+              <button class="cc-del" data-cmp-del="${slug}" aria-label="移除">${ICON.close}</button>
+            </div>
+            <div class="cc-price"><span class="cc-na">无此油品</span></div>
+            <div class="cc-foot">该城市不供应 ${grade}</div>
           </div>`;
       }
 
@@ -1046,9 +1068,7 @@ function renderComparePage() {
           style="animation-delay:${i * 40}ms">
           <span class="cc-glow" style="background:${gradeColorCss(grade)}"></span>
           <div class="cc-top">
-            <span class="cc-name">${name}${
-        isAuto ? '<i class="cc-auto" title="跟随首页"></i>' : ""
-      }</span>
+            <span class="cc-name">${name}</span>
             <button class="cc-del" data-cmp-del="${slug}" aria-label="移除">${ICON.close}</button>
           </div>
           <div class="cc-price">
@@ -1493,10 +1513,13 @@ function switchCity(slug) {
   state.current = slug;
   STORE.write(STORE.current, slug);
   state.tab = "home";
-  // 首页切换 → 同步「跟随项」，让对比页里的城市跟着变
-  syncCompareWithCurrent(slug);
+  // 对比列表与首页完全解耦：切换首页城市不再改动对比列表，
+  // 用户在对比页选定的城市集合保持不变。
   syncCityToWidget(slug);
-  loadPrice(slug);
+  // 有缓存时静默刷新：先用缓存立即渲染（标记、价格马上可见），
+  // 再在后台拉新数据。原实现不传 silent，切换瞬间若缓存命中会
+  // 走骨架屏，标记有一帧缺失，观感上像"标记没了"。
+  loadPrice(slug, { silent: !!state.cache[slug] });
 }
 
 /**
