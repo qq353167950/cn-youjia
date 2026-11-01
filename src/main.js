@@ -283,8 +283,10 @@ function recordHistory(priceData) {
   const bucket = state.history[slug] || [];
 
   for (const f of priceData.fuels) {
-    // 只在有对应油品时记录
-    if (f.grade !== state.selectedGrade) continue;
+    // 记录接口返回的全部油品（92/95/98/0#/-10#…），
+    // 不能只看 state.selectedGrade —— 那样切到 95# 之后
+    // 趋势页永远只有 92# 一条曲线，其余油品全是空。
+    if (!f || !f.grade || !(f.price > 0)) continue;
     const idx = bucket.findIndex((it) => it.d === day && it.g === f.grade);
     const entry = { d: day, g: f.grade, v: f.price, t: Date.now() };
     if (idx >= 0) bucket[idx] = entry;
@@ -293,8 +295,16 @@ function recordHistory(priceData) {
 
   // 每天每个油品最多一条，但允许不同油品并存 —— 这里按油品分别存
   bucket.sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
-  // 只留最近 120 天
-  state.history[slug] = bucket.slice(-240);
+  // 只留最近 120 天 × 全部油品（原先硬编码 240 条会在多油品下把
+  // 早期数据整段裁掉，导致切 95#/98# 时曲线只剩一两个点）
+  const KEEP_DAYS = 120;
+  const days = [];
+  for (let i = bucket.length - 1; i >= 0; i--) {
+    if (days.indexOf(bucket[i].d) < 0) days.push(bucket[i].d);
+    if (days.length >= KEEP_DAYS) break;
+  }
+  const cutoff = days.length ? days[days.length - 1] : day;
+  state.history[slug] = bucket.filter((it) => it.d >= cutoff);
   STORE.write(STORE.history, state.history);
 }
 
@@ -330,6 +340,25 @@ async function loadPrice(slug, { silent = false } = {}) {
     render();
     return null;
   }
+}
+
+/**
+ * 切油品时的静默刷新：不转圈、不弹 toast、不动当前页状态，
+ * 只把该城市最新价格重新落一次历史记录。
+ *
+ * 目的：趋势页切到 95#/98# 时，如果今天还没记录过这个油品，
+ * 立刻补一条当天点位，不必等下一次手动刷新或重启应用。
+ *
+ * 同一城市 15 秒内只拉一次，避免用户来回点标签把接口打爆。
+ */
+const silentRefreshAt = {};
+function silentRefresh(slug) {
+  if (!slug) return;
+  const now = Date.now();
+  if (silentRefreshAt[slug] && now - silentRefreshAt[slug] < 15000) return;
+  silentRefreshAt[slug] = now;
+  // 不 await：后台跑，失败也不打断 UI
+  loadPrice(slug, { silent: true }).catch(function () {});
 }
 
 /**
@@ -1201,6 +1230,9 @@ function bindEvents() {
           state.compareGrade = g;
         } else {
           state.selectedGrade = g;
+          // 趋势页切油品：后台补一次当天点位，否则新油品的曲线要
+          // 等到下一次刷新才有数据；首页切油品不需要重拉。
+          if (state.tab === "trend") silentRefresh(state.current);
         }
         render();
         return;
@@ -1240,6 +1272,9 @@ function bindEvents() {
       state.tab = tab.dataset.tab;
       render();
       if (state.tab === "compare") loadCompare();
+      // 进入趋势页同样静默补一次：首次打开时当天多半还没记录，
+      // 补完后当前油品立刻有点位（曲线仍需 ≥2 天才会画出来）。
+      if (state.tab === "trend") silentRefresh(state.current);
     });
   }
 
