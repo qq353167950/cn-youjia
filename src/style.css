@@ -546,6 +546,26 @@ body {
   font-size: 14.5px; font-weight: 600; font-family: inherit; cursor: pointer; padding: 4px;
 }
 .search-wrap { padding: 0 20px 12px; flex-shrink: 0; }
+/* 非首次渲染时关闭入场动画，避免每次刷新数据都重放导致页面闪烁。
+   目前只有 .fuel-square 与 .cmp-card 带 rise 入场动画。 */
+.no-anim .fuel-square,
+.no-anim .cmp-card {
+  animation: none !important;
+}
+/* 常用城市：搜索框下方快捷区，无历史时整块不渲染 */
+.recent-wrap {
+  padding: 0 20px 14px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--hairline);
+  margin-bottom: 10px;
+}
+.recent-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11.5px; font-weight: 650; color: var(--text-tertiary);
+  letter-spacing: .08em; padding: 2px 4px 8px;
+}
+.recent-label svg { width: 12px; height: 12px; }
+.recent-items { display: flex; flex-wrap: wrap; gap: 8px; }
 .search-box {
   display: flex; align-items: center; gap: 8px; height: 42px; padding: 0 14px;
   border-radius: 15px;

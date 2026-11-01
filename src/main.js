@@ -186,6 +186,13 @@ const state = {
    */
   compareList: STORE.read("yj.compareList", []),
 
+  /**
+   * 常用城市：用户通过搜索选过的城市，按最近使用排序，用于在
+   * 城市选择面板搜索框下方提供快捷入口，省掉每次重新搜索。
+   * 空数组时该区块整块不渲染。
+   */
+  recentCities: STORE.read("yj.recentCities", []),
+
   cache: STORE.read(STORE.cache, {}),
   history: STORE.read(STORE.history, {}),
   selectedGrade: "92#",
@@ -229,6 +236,26 @@ function addCompareCity(slug) {
     state.compareList.push(slug);
   }
   saveCompare();
+}
+
+/* ---------- 常用城市（最近搜索过并选中） ---------- */
+const RECENT_MAX = 8;
+
+/**
+ * 把城市记入"常用城市"。
+ *
+ * 只记录用户真正选中的城市（搜索后点了某个城市，或从常用里再点一次），
+ * 单纯输入关键词不记录 —— 这样列表里都是有意义的、点得到的城市。
+ * 已在列表中的会提到最前面，最多保留 RECENT_MAX 个。
+ */
+function pushRecentCity(slug) {
+  if (!slug) return;
+  var list = state.recentCities.filter(function (s) {
+    return s !== slug;
+  });
+  list.unshift(slug);
+  state.recentCities = list.slice(0, RECENT_MAX);
+  STORE.write("yj.recentCities", state.recentCities);
 }
 
 /**
@@ -367,6 +394,31 @@ async function loadCompare() {
   }
 }
 
+/**
+ * 恢复油号栏（.grade-tabs）的横向滚动位置。
+ *
+ * render() 整体重写 innerHTML，滚动容器的 scrollLeft 会归零，
+ * 于是用户滑到后面选了 95#/-10#，一渲染就跳回最左的 92#。
+ * 渲染完成后把位置还原，并确保选中项在可视区内。
+ */
+function restoreGradeTabsScroll(left) {
+  var bars = document.querySelectorAll(".grade-tabs");
+  if (!bars.length) return;
+  bars.forEach(function (bar) {
+    if (left > 0) bar.scrollLeft = left;
+    // 选中项若被裁在视口外，滚到能看见为止
+    var active = bar.querySelector(".grade-tab.active");
+    if (!active) return;
+    var b = bar.getBoundingClientRect();
+    var a = active.getBoundingClientRect();
+    if (a.left < b.left) {
+      bar.scrollLeft -= b.left - a.left + 8;
+    } else if (a.right > b.right) {
+      bar.scrollLeft += a.right - b.right + 8;
+    }
+  });
+}
+
 /* ===================================================================
  * 工具函数
  * =================================================================== */
@@ -445,6 +497,7 @@ function toast(msg) {
 const ICON = {
   refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3.2-6.9"/><path d="M21 3v6h-6"/></svg>`,
   search: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>`,
+  clock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.4V12l3 1.8"/></svg>`,
   home: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V20h13V9.5"/></svg>`,
   chart: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V6"/><path d="M4 19h16"/><path d="M7.5 15.5 11 11l3 2.5 4.5-6"/></svg>`,
   star: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3.5 2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1L3.2 10l6.1-.9z"/></svg>`,
@@ -535,8 +588,16 @@ function getApp() {
   return appEl;
 }
 
+/**
+ * 是否已经渲染过一次：用于抑制重复渲染时的入场动画。
+ * 反复刷新数据会整体重写 innerHTML，若不抑制，卡片会不断重放入场动画，
+ * 页面看起来就一直在闪。
+ */
+let hasRendered = false;
+/** 下一次渲染是否允许播放入场动画（换 Tab 时置 true，正常刷新为 false） */
+let allowAnim = false;
+
 function render() {
-  const data = state.cache[state.current];
   const fuels = data?.fuels || [];
   // 当前选中油品若不存在，回退到第一个
   let grade = state.selectedGrade;
@@ -557,6 +618,15 @@ function render() {
       ? renderTrendPage(data, fuels, grade)
       : renderComparePage();
 
+  // 入场动画只在首次渲染和切换 Tab 时播放。
+  // 其它情况（定时刷新、切油品、切城市、静默补点）都是重写 innerHTML，
+  // 若每次都重放 rise 动画，页面就会一直闪。非允许状态下给根节点
+  // 加 .no-anim，由 CSS 直接关掉动画。
+  const playAnim = !hasRendered || allowAnim;
+  root.classList.toggle("no-anim", !playAnim);
+  hasRendered = true;
+  allowAnim = false;
+
   root.innerHTML = `
     <div class="aurora"></div>
     ${renderTopbar(data)}
@@ -566,6 +636,8 @@ function render() {
     ${renderCalcModal()}
     <div class="toast" id="toast"></div>
   `;
+
+  bindEvents();
 
   bindEvents();
 }
@@ -1170,11 +1242,30 @@ function renderRegionSheet() {
             )}" />
           </div>
         </div>
+        ${q ? "" : renderRecentCities()}
         <div class="region-list" id="regionList">${content}</div>
       </div>
     </div>`;
 }
 
+/**
+ * 常用城市快捷区：显示在搜索框正下方。
+ * 没有历史搜索时整块不渲染（不占位、不留空白）。
+ */
+function renderRecentCities() {
+  const list = state.recentCities.filter(function (s) {
+    return s && REGION_NAME[s];
+  });
+  if (list.length === 0) return "";
+  return `<div class="recent-wrap">
+      <div class="recent-label">${ICON.clock}常用城市</div>
+      <div class="recent-items">${list
+        .map(function (s) {
+          return regionChip(s, REGION_NAME[s]);
+        })
+        .join("")}</div>
+    </div>`;
+}
 /* 单个城市胶囊：当前城市高亮；已在对比列表中的带小圆点 */
 function regionChip(slug, name) {
   const isCur = slug === state.current;
@@ -1246,6 +1337,10 @@ function bindEvents() {
       if (gradeTab) {
         haptic();
         var g = gradeTab.dataset.gradeTab;
+        // 记录油号栏当前滚动位置：render() 会重建 DOM，
+        // 不恢复的话横向滚动会被重置到最左（选了靠后的油号就"跳回去"）。
+        var bar = gradeTab.closest(".grade-tabs");
+        var savedScroll = bar ? bar.scrollLeft : 0;
         if (gradeTab.dataset.kind === "compare") {
           state.compareGrade = g;
         } else {
@@ -1255,6 +1350,7 @@ function bindEvents() {
           if (state.tab === "trend") silentRefresh(state.current);
         }
         render();
+        restoreGradeTabsScroll(savedScroll);
         return;
       }
 
@@ -1288,8 +1384,14 @@ function bindEvents() {
     tabbar.addEventListener("click", function (e) {
       var tab = e.target.closest("[data-tab]");
       if (!tab) return;
+      var next = tab.dataset.tab;
+      // 重复点击当前 Tab 直接忽略：render() 会整体重写 innerHTML，
+      // 卡片带的入场动画会重放，观感就是"页面闪一下"。
+      // 连点连闪正是这个原因，这里提前返回即可彻底消除。
+      if (next === state.tab) return;
       haptic();
-      state.tab = tab.dataset.tab;
+      state.tab = next;
+      allowAnim = true; // 换页面时允许播一次入场动画
       render();
       if (state.tab === "compare") loadCompare();
       // 进入趋势页同样静默补一次：首次打开时当天多半还没记录，
@@ -1371,6 +1473,9 @@ function bindEvents() {
       if (!item) return;
       haptic();
       var slug = item.dataset.region;
+      // 选中即记入"常用城市"，下次打开面板可在搜索框下方直接点
+      pushRecentCity(slug);
+      state.regionSheetOpen = false;
       state.regionSheetOpen = false;
       state.searchQuery = "";
 
@@ -1398,6 +1503,8 @@ function bindEvents() {
         // 原先调用 render() 会让 .sheet 重新挂载、动画从 translateY(102%) 重来，
         // 表现就是"面板缩回底部"，被键盘挡住。
         refreshRegionList();
+        // 常用城市区跟着搜索状态显隐：有输入时收起，清空后恢复
+        refreshRecentBlock();
       }, 120);
     });
   }
@@ -1445,6 +1552,31 @@ function refreshRegionList() {
 
   list.innerHTML = html;
   list.scrollTop = 0;
+}
+
+/**
+ * 搜索输入时同步常用城市区的显隐。
+ *
+ * 面板不整体重建（避免动画重放/键盘收起），因此这里手动切换：
+ * 有搜索词时隐藏，清空后按历史记录重新渲染出来。
+ */
+function refreshRecentBlock() {
+  var wrap = document.querySelector(".recent-wrap");
+  var sheet = document.querySelector(".sheet");
+  if (!sheet) return;
+  var q = state.searchQuery.trim();
+  if (q) {
+    if (wrap) wrap.remove();
+    return;
+  }
+  if (!wrap) {
+    // 清空搜索后又需要显示：把区块插回搜索框后面
+    var searchWrap = sheet.querySelector(".search-wrap");
+    if (!searchWrap) return;
+    var html = renderRecentCities();
+    if (!html) return;
+    searchWrap.insertAdjacentHTML("afterend", html);
+  }
 }
 
 
