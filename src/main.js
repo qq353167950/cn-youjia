@@ -844,6 +844,7 @@ let hasRendered = false;
 let allowAnim = false;
 
 function render() {
+  const data = state.cache[state.current];
   const fuels = data?.fuels || [];
   // 当前选中油品若不存在，回退到第一个
   let grade = state.selectedGrade;
