@@ -1961,12 +1961,25 @@ function syncCityToWidget(slug) {
 }
 
 /**
- * 小组件上显示的调价文案（精简版）。
- * 例：调价 12/8 · 14天 / 调价 今日24时 / （空字符串表示不显示）
+ * 小组件上显示的文案（精简版）。
+ *
+ * 优先显示调价倒计时（需要当年的节假日数据才算得准）：
+ *   调价 12/8 · 14天 / 调价 明日24时 / 调价 今日24时
+ *
+ * 节假日数据没取到时，不硬凑一个可能错误的日期，而是回退显示
+ * 最近一次数据更新时间 —— 这比让右侧空白更有信息量。
  */
 function widgetAdjustText() {
   const base = new Date();
-  if (holidayTable.year !== base.getFullYear()) return "";
+  if (holidayTable.year !== base.getFullYear()) {
+    const data = state.cache[state.current];
+    const ts = data && data.updated_at;
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return "更新 " + hh + ":" + mm;
+  }
   const info = adjustInfo(base);
   if (!info.date) return "";
   const d = info.date;

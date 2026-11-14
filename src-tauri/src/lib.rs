@@ -581,7 +581,11 @@ async fn get_prices(
 ///                        "01-04":{"holiday":false,"date":"2026-01-04",...}}}
 /// holiday=true 是放假，false 是调休补班。
 async fn fetch_holidays(client: &reqwest::Client, year: i32) -> Option<HolidayYear> {
-    let url = format!("https://timor.tech/api/holiday/year/{}", year);
+    // 用 http 而非 https：本项目 reqwest 启用 rustls-tls-native-roots，
+    // 该特性在 Android 上读取系统证书的方式与桌面不同，实测会导致请求失败；
+    // 加上 Cargo.toml 里 panic=abort，TLS 层一旦 panic 就是直接闪退。
+    // 油价数据源本身就是 http，这里保持一致，不引入额外 TLS 依赖风险。
+    let url = format!("http://timor.tech/api/holiday/year/{}", year);
     let resp = client
         .get(&url)
         .header(reqwest::header::USER_AGENT, UA)
